@@ -33,7 +33,7 @@ def ensure_database_exists():
         try:
             with st.spinner("Downloading soccer database (first-time setup)..."):
                 url = "https://github.com/jokecamp/FootballData/raw/master/openFootballData/database.sqlite"
-                urllib.request.urlretrieve(url, str(SOCCER_DB_PATH))
+                urllib.request.urlretrieve(url, str(SOCER_DB_PATH))
                 st.success("Database downloaded successfully!")
         except Exception as e:
             st.error(f"Failed to download database: {str(e)}")
@@ -103,9 +103,9 @@ class FootballPredictor:
                 return True, "Login successful!"
             return False, "Invalid username or password."
 
-# --- Data Loading ---
+# --- Data Loading (Fixed Caching) ---
 @st.cache_data(ttl=3600, show_spinner="Loading match data...")
-def load_data():
+def load_data(_dummy=None):  # Added dummy parameter for caching
     """Load match data from SQLite with proper path handling."""
     try:
         if not SOCCER_DB_PATH.exists():
@@ -273,8 +273,10 @@ def main():
         st.session_state.logged_in = False
         st.session_state.username = None
 
-    # Load data and predictor
+    # Initialize predictor
     predictor = FootballPredictor()
+    
+    # Load data (with fixed caching)
     matches_df, team_mapping_tuple = load_data()
     
     if matches_df.empty:
