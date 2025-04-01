@@ -33,7 +33,7 @@ def ensure_database_exists():
         try:
             with st.spinner("Downloading soccer database (first-time setup)..."):
                 url = "https://github.com/jokecamp/FootballData/raw/master/openFootballData/database.sqlite"
-                urllib.request.urlretrieve(url, str(SOCER_DB_PATH))
+                urllib.request.urlretrieve(url, str(SOCCER_DB_PATH))
                 st.success("Database downloaded successfully!")
         except Exception as e:
             st.error(f"Failed to download database: {str(e)}")
