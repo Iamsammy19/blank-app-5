@@ -82,7 +82,6 @@ class FootballPredictor:
 
                 if not downloaded:
                     logging.info("All downloads failed. Creating a minimal fallback database.")
-                    # Create a new empty database as fallback
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.cursor()
                     cursor.execute("""
@@ -126,6 +125,28 @@ class FootballPredictor:
             st.error(f"Application error: {str(e)}")
             raise
 
+    def load_data(self):
+        """Load football match data from the SQLite database into a DataFrame."""
+        try:
+            # Query the matches table with a limit based on environment
+            query = "SELECT * FROM matches LIMIT ?"
+            self.matches_df = pd.read_sql_query(query, self.conn, params=(self.data_limit,))
+            logging.info(f"Loaded {len(self.matches_df)} matches from database")
+            
+            if self.matches_df.empty:
+                logging.warning("No data found in matches table")
+                st.warning("No match data available in the database")
+            
+            # Optional: Basic data validation or preprocessing
+            required_columns = ['date', 'home_team', 'away_team', 'home_goals', 'away_goals']
+            if not all(col in self.matches_df.columns for col in required_columns):
+                raise ValueError("Database missing required columns")
+            
+        except Exception as e:
+            logging.error(f"Error loading data: {e}")
+            st.error(f"Data loading error: {str(e)}")
+            raise
+
     def _verify_environment(self):
         """Environment checks with psutil fallback"""
         if self.is_cloud and not Path('/tmp').exists():
@@ -147,8 +168,7 @@ class FootballPredictor:
                 self.data_limit = 10_000
 
     # [Keep all other methods unchanged from previous implementation]
-    # load_data(), _add_features(), load_model(), 
-    # _create_fallback_model(), authenticate_user(), etc.
+    # _add_features(), load_model(), _create_fallback_model(), authenticate_user(), etc.
 
 def main():
     st.set_page_config(page_title="Football Predictor", page_icon="⚽", layout="wide")
