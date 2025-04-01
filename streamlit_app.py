@@ -58,25 +58,53 @@ class FootballPredictor:
         try:
             # Ensure the database file exists at DB_PATH
             if not DB_PATH.exists():
-                logging.info(f"Creating new database at {DB_PATH}")
-                # Download a source database if needed
+                logging.info(f"Database not found at {DB_PATH}. Attempting download...")
+                downloaded = False
                 for url in DB_SOURCES:
                     try:
+                        logging.info(f"Downloading from {url}")
                         urllib.request.urlretrieve(url, DB_PATH)
-                        logging.info(f"Database downloaded from {url}")
-                        break
+                        # Verify it's a SQLite database
+                        with open(DB_PATH, 'rb') as f:
+                            header = f.read(16)  # SQLite header is 16 bytes
+                            if header.startswith(b"SQLite format 3"):
+                                logging.info(f"Valid SQLite database downloaded from {url}")
+                                downloaded = True
+                                break
+                            else:
+                                logging.warning(f"Downloaded file from {url} is not a SQLite database")
+                                DB_PATH.unlink()  # Remove invalid file
                     except Exception as e:
                         logging.warning(f"Failed to download from {url}: {e}")
+                        if DB_PATH.exists():
+                            DB_PATH.unlink()  # Clean up partial download
                         continue
-                else:
-                    raise Exception("Failed to download database from all sources")
-            
+
+                if not downloaded:
+                    logging.info("All downloads failed. Creating a minimal fallback database.")
+                    # Create a new empty database as fallback
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS matches (
+                            id INTEGER PRIMARY KEY,
+                            date TEXT,
+                            home_team TEXT,
+                            away_team TEXT,
+                            home_goals INTEGER,
+                            away_goals INTEGER
+                        )
+                    """)
+                    conn.commit()
+                    conn.close()
+                    logging.info(f"Fallback database created at {DB_PATH}")
+
             # Connect to the database
             self.conn = sqlite3.connect(DB_PATH)
             self.cursor = self.conn.cursor()
-            logging.info(f"Database initialized at {DB_PATH}")
-            
-            # Optional: Create any necessary tables (adjust as per your schema)
+            logging.info(f"Database connection established at {DB_PATH}")
+
+            # Ensure the matches table exists
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
                     id INTEGER PRIMARY KEY,
@@ -88,10 +116,14 @@ class FootballPredictor:
                 )
             """)
             self.conn.commit()
-            
-        except Exception as e:
-            logging.error(f"Failed to initialize database: {e}")
+
+        except sqlite3.DatabaseError as e:
+            logging.error(f"SQLite database error: {e}")
             st.error(f"Database error: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error in init_db: {e}")
+            st.error(f"Application error: {str(e)}")
             raise
 
     def _verify_environment(self):
