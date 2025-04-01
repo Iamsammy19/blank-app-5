@@ -13,226 +13,223 @@ from pathlib import Path
 import tempfile
 import urllib.request
 from datetime import datetime
-
-# Handle optional psutil import
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    st.sidebar.warning("psutil not installed - memory monitoring disabled")
+import time
+import threading
+from typing import Dict, Tuple, Optional
 
 # Configure logging
-logging.basicConfig(filename='app.log', level=logging.INFO,
-                  format='%(asctime)s - %(levelname)s - %(message)s')
-
-# --- Constants ---
-DB_SOURCES = [
-    "https://github.com/jokecamp/FootballData/raw/master/openFootballData/database.sqlite",
-    "https://drive.google.com/uc?export=download&id=1G1x3UWdQl4zZ3N1-Bk1Q2Q4LdR9D7Qy_",
-    "https://www.dropbox.com/s/8u3wq5q7v9y5s9x/database.sqlite?dl=1"
-]
-
-# --- Path Configuration ---
-BASE_DIR = Path(__file__).parent
-DB_PATH = Path(tempfile.gettempdir()) / "football_predictor.db"
-MODEL_PATH = Path(tempfile.gettempdir()) / "xgboost_model.pkl"
-SOCCER_DB_PATH = BASE_DIR / "soccer.sqlite"
+logging.basicConfig(
+    filename='football_predictor.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 class FootballPredictor:
     def __init__(self):
         self.is_cloud = os.getenv('IS_STREAMLIT_CLOUD', False)
-        self.data_limit = 20_000 if self.is_cloud else 50_000
+        self.data_limit = 10_000 if self.is_cloud else 50_000
         self.matches_df = pd.DataFrame()
-        self.team_mapping = {}
+        self.team_mapping: Dict[str, int] = {}
         self.model = None
-        self.feature_names = []
         
-        self.init_db()
-        self.load_data()
-        self.load_model()
+        self._init_db()
+        self._load_data()
+        self._load_model()
         self._verify_environment()
+        
+        if self.is_cloud:
+            self._start_memory_watchdog()
 
-    def init_db(self):
-        """Initialize the SQLite database connection and setup."""
+    def _init_db(self) -> None:
+        """Initialize and validate the database connection."""
+        self.DB_PATH = Path(tempfile.gettempdir()) / "football_predictor.db"
+        
         try:
-            # Ensure the database file exists at DB_PATH
-            if not DB_PATH.exists():
-                logging.info(f"Database not found at {DB_PATH}. Attempting download...")
-                downloaded = False
-                for url in DB_SOURCES:
-                    try:
-                        logging.info(f"Downloading from {url}")
-                        urllib.request.urlretrieve(url, DB_PATH)
-                        # Verify it's a SQLite database
-                        with open(DB_PATH, 'rb') as f:
-                            header = f.read(16)  # SQLite header is 16 bytes
-                            if header.startswith(b"SQLite format 3"):
-                                logging.info(f"Valid SQLite database downloaded from {url}")
-                                downloaded = True
-                                break
-                            else:
-                                logging.warning(f"Downloaded file from {url} is not a SQLite database")
-                                DB_PATH.unlink()  # Remove invalid file
-                    except Exception as e:
-                        logging.warning(f"Failed to download from {url}: {e}")
-                        if DB_PATH.exists():
-                            DB_PATH.unlink()  # Clean up partial download
-                        continue
-
-                if not downloaded:
-                    logging.info("All downloads failed. Creating a minimal fallback database.")
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS matches (
-                            id INTEGER PRIMARY KEY,
-                            date TEXT,
-                            home_team TEXT,
-                            away_team TEXT,
-                            home_goals INTEGER,
-                            away_goals INTEGER
-                        )
-                    """)
-                    # Add sample data
-                    sample_matches = [
-                        ('2023-01-01', 'Team A', 'Team B', 2, 1),
-                        ('2023-01-02', 'Team C', 'Team D', 0, 0),
-                        ('2023-01-03', 'Team E', 'Team F', 1, 3)
-                    ]
-                    cursor.executemany(
-                        "INSERT INTO matches (date, home_team, away_team, home_goals, away_goals) VALUES (?, ?, ?, ?, ?)",
-                        sample_matches
+            # Retry logic for database connection
+            for attempt in range(3):
+                try:
+                    self.conn = sqlite3.connect(
+                        f"file:{self.DB_PATH}?mode=rwc", 
+                        uri=True,
+                        timeout=10
                     )
-                    conn.commit()
-                    conn.close()
-                    logging.info(f"Fallback database created at {DB_PATH} with sample data")
-
-            # Connect to the database
-            self.conn = sqlite3.connect(DB_PATH)
-            self.cursor = self.conn.cursor()
-            logging.info(f"Database connection established at {DB_PATH}")
-
-            # Ensure the matches table exists
-            self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS matches (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT,
-                    home_team TEXT,
-                    away_team TEXT,
-                    home_goals INTEGER,
-                    away_goals INTEGER
-                )
-            """)
-            self.conn.commit()
-
-        except sqlite3.DatabaseError as e:
-            logging.error(f"SQLite database error: {e}")
-            st.error(f"Database error: {str(e)}")
-            raise
+                    self.cursor = self.conn.cursor()
+                    break
+                except sqlite3.OperationalError as e:
+                    if attempt == 2:
+                        raise
+                    time.sleep(1)
+            
+            # Schema initialization with error recovery
+            with self.conn:
+                self.cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS matches (
+                        id INTEGER PRIMARY KEY,
+                        date TEXT NOT NULL,
+                        home_team TEXT NOT NULL,
+                        away_team TEXT NOT NULL,
+                        home_goals INTEGER CHECK(home_goals >= 0),
+                        away_goals INTEGER CHECK(away_goals >= 0),
+                        CHECK(home_team != away_team)
+                """)
+                
+                # Add sample data if empty
+                if self.cursor.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 0:
+                    self._load_sample_matches()
+                    
         except Exception as e:
-            logging.error(f"Unexpected error in init_db: {e}")
-            st.error(f"Application error: {str(e)}")
-            raise
+            logging.critical(f"Database initialization failed: {str(e)}")
+            st.error("Critical system error - please try again later")
+            raise SystemExit(1)
 
-    def load_data(self):
-        """Load football match data from the SQLite database into a DataFrame."""
+    def _load_sample_matches(self) -> None:
+        """Load sample matches into empty database."""
+        sample_data = [
+            ('2023-01-01', 'Arsenal', 'Chelsea', 2, 1),
+            ('2023-01-02', 'Man City', 'Liverpool', 1, 1),
+            ('2023-01-03', 'Tottenham', 'Man United', 0, 2)
+        ]
         try:
-            # Query the matches table with a limit based on environment
-            query = "SELECT * FROM matches LIMIT ?"
-            self.matches_df = pd.read_sql_query(query, self.conn, params=(self.data_limit,))
-            logging.info(f"Loaded {len(self.matches_df)} matches from database")
+            self.cursor.executemany(
+                """INSERT INTO matches 
+                (date, home_team, away_team, home_goals, away_goals)
+                VALUES (?, ?, ?, ?, ?)""",
+                sample_data
+            )
+            logging.info("Loaded sample match data")
+        except Exception as e:
+            logging.error(f"Failed to load sample data: {str(e)}")
+
+    def _load_data(self) -> bool:
+        """Load and validate match data from database."""
+        try:
+            query = """
+                SELECT date, home_team, away_team, home_goals, away_goals 
+                FROM matches 
+                ORDER BY date DESC 
+                LIMIT ?
+            """
+            self.matches_df = pd.read_sql_query(
+                query, 
+                self.conn, 
+                params=(self.data_limit,),
+                parse_dates=['date']
+            )
             
             if self.matches_df.empty:
-                logging.warning("No data found in matches table")
-                st.warning("No match data available in the database")
+                logging.warning("No match data found in database")
                 return False
+                
+            # Data validation
+            self.matches_df.dropna(inplace=True)
+            self.matches_df = self.matches_df[
+                (self.matches_df['home_goals'] >= 0) & 
+                (self.matches_df['away_goals'] >= 0)
+            ]
             
-            # Optional: Basic data validation or preprocessing
-            required_columns = ['date', 'home_team', 'away_team', 'home_goals', 'away_goals']
-            if not all(col in self.matches_df.columns for col in required_columns):
-                raise ValueError("Database missing required columns")
-            
-            # Create team mapping for consistent team IDs
-            all_teams = pd.concat([self.matches_df['home_team'], self.matches_df['away_team']]).unique()
+            # Create team mapping
+            all_teams = pd.concat([
+                self.matches_df['home_team'], 
+                self.matches_df['away_team']
+            ]).unique()
             self.team_mapping = {team: idx for idx, team in enumerate(all_teams)}
             
             return True
             
         except Exception as e:
-            logging.error(f"Error loading data: {e}")
-            st.error(f"Data loading error: {str(e)}")
-            raise
+            logging.error(f"Data loading failed: {str(e)}")
+            st.error("Failed to load match data")
+            return False
 
-    def load_model(self):
-        """Load the trained XGBoost model from file or create a fallback model."""
+    def _load_model(self) -> None:
+        """Load or create prediction model with validation."""
+        self.MODEL_PATH = Path(tempfile.gettempdir()) / "xgboost_model.pkl"
+        
         try:
-            if MODEL_PATH.exists():
-                logging.info(f"Loading model from {MODEL_PATH}")
-                # Verify the model file is valid
-                if MODEL_PATH.stat().st_size < 100:  # Minimum expected size
-                    raise ValueError("Model file appears corrupted")
+            if self.MODEL_PATH.exists():
+                # Model validation
+                if self.MODEL_PATH.stat().st_size < 100:
+                    raise ValueError("Model file too small")
                     
-                with open(MODEL_PATH, 'rb') as f:
+                with open(self.MODEL_PATH, 'rb') as f:
                     self.model = joblib.load(f)
                     
-                # Verify the loaded model has the predict method
                 if not hasattr(self.model, 'predict'):
-                    raise AttributeError("Loaded model missing predict method")
+                    raise AttributeError("Invalid model format")
                     
-                logging.info("Model loaded and validated")
+                logging.info("Model loaded successfully")
             else:
-                logging.warning(f"No model found at {MODEL_PATH}")
                 self._create_fallback_model()
                 
-        except (EOFError, ValueError) as e:
-            logging.error(f"Model file corrupted: {e}")
-            st.warning("Model file corrupted - using fallback")
-            self._create_fallback_model()
         except Exception as e:
-            logging.error(f"Unexpected error loading model: {e}")
-            st.warning("Failed to load prediction model - using fallback")
+            logging.error(f"Model loading failed: {str(e)}")
             self._create_fallback_model()
 
-    def _create_fallback_model(self):
-        """Create a simple fallback model when no trained model is available."""
-        logging.info("Creating fallback model")
+    def _create_fallback_model(self) -> None:
+        """Create a fallback prediction model."""
+        logging.warning("Creating fallback prediction model")
         
         class FallbackModel:
-            def __init__(self, matches_df):
-                self.matches_df = matches_df
+            def __init__(self, matches_df: pd.DataFrame):
+                self.data = matches_df
+                self.home_avg = matches_df['home_goals'].mean()
+                self.away_avg = matches_df['away_goals'].mean()
                 
-            def predict(self, home_team, away_team):
-                """Predict match outcome using historical averages."""
+            def predict(self, home_team: str, away_team: str) -> Tuple[float, float]:
+                """Predict using team-specific averages or fallback to league averages."""
                 try:
-                    if self.matches_df.empty:
-                        return (1.5, 1.0)  # Default averages if no data
+                    home_avg = self.data[
+                        self.data['home_team'] == home_team
+                    ]['home_goals'].mean()
                     
-                    # Calculate team-specific averages if available
-                    home_avg = self.matches_df[self.matches_df['home_team'] == home_team]['home_goals'].mean()
-                    away_avg = self.matches_df[self.matches_df['away_team'] == away_team]['away_goals'].mean()
+                    away_avg = self.data[
+                        self.data['away_team'] == away_team
+                    ]['away_goals'].mean()
                     
-                    # Fall back to general averages if team-specific data not available
-                    if np.isnan(home_avg):
-                        home_avg = self.matches_df['home_goals'].mean()
-                    if np.isnan(away_avg):
-                        away_avg = self.matches_df['away_goals'].mean()
-                        
-                    return (home_avg, away_avg)
-                    
-                except Exception as e:
-                    logging.error(f"Fallback model prediction error: {e}")
-                    return (1.5, 1.0)  # Default averages if error occurs
+                    return (
+                        home_avg if not np.isnan(home_avg) else self.home_avg,
+                        away_avg if not np.isnan(away_avg) else self.away_avg
+                    )
+                except:
+                    return (self.home_avg, self.away_avg)
                     
         self.model = FallbackModel(self.matches_df)
-        logging.warning("Using fallback prediction model")
 
-    def predict_match(self, home_team, away_team):
-        """Predict the outcome of a match between two teams."""
+    def _verify_environment(self) -> None:
+        """Check system resources and constraints."""
         try:
-            if not hasattr(self, 'model') or self.model is None:
-                raise AttributeError("Prediction model not loaded")
-                
-            home_goals, away_goals = self.model.predict(home_team, away_team)
+            # Memory check
+            test_array = np.zeros((1000, 1000))  # ~8MB
+            del test_array
             
-            # Convert to Poisson probabilities
+            # Cloud-specific checks
+            if self.is_cloud and not Path('/tmp').exists():
+                raise RuntimeError("Invalid cloud environment")
+                
+        except MemoryError:
+            logging.warning("Memory constraints detected")
+            self.data_limit = 5_000
+        except Exception as e:
+            logging.warning(f"Environment verification failed: {str(e)}")
+
+    def _start_memory_watchdog(self) -> None:
+        """Monitor memory usage in cloud environment."""
+        def watchdog():
+            while True:
+                try:
+                    mem = psutil.virtual_memory()
+                    if mem.percent > 90:
+                        logging.critical("Memory limit exceeded - exiting")
+                        os._exit(1)
+                    time.sleep(30)
+                except:
+                    pass
+                    
+        threading.Thread(target=watchdog, daemon=True).start()
+
+    def _validate_teams(self, home_team: str, away_team: str) -> bool:
+        """Validate team inputs before prediction."""
+        if not all(isinstance(t, str) for t in [home_team, away_team]):
+            raise ValueError("Team names must be strings")
+        if home_team not in self.team_mapping:
+            raise ValueError(f"Unknown home team: {home_
