@@ -236,7 +236,7 @@ def show_prediction_page(predictor):
             
             # Prepare features
             features = pd.DataFrame([[home_form, away_form]], 
-                                  columns=predictor.feature_names)
+                                 columns=predictor.feature_names)
             
             # Predict
             pred_home_goals = predictor.model.predict(features)[0]
@@ -260,5 +260,45 @@ def show_prediction_page(predictor):
                     prob_matrix[i,j] = poisson.pmf(i, pred_home_goals) * poisson.pmf(j, pred_away_goals)
             
             # Display as a dataframe
-            prob_df = pd.DataFrame(prob_matrix, 
-                                 index=[f"Home {i}" for i in
+            prob_df = pd.DataFrame(
+                prob_matrix, 
+                index=[f"Home {i}" for i in range(max_goals+1)],
+                columns=[f"Away {j}" for j in range(max_goals+1)]
+            )
+            st.dataframe(prob_df.style.format("{:.2%}").background_gradient(cmap='Blues'))
+            
+        except Exception as e:
+            st.error(f"Prediction failed: {str(e)}")
+    
+    # Logout button
+    if st.button("Logout"):
+        st.session_state.logged_in = False
+        st.experimental_rerun()
+
+def main():
+    st.set_page_config(page_title="Football Predictor", page_icon="⚽", layout="wide")
+    
+    # Initialize predictor with error handling
+    try:
+        predictor = FootballPredictor()
+        
+        # Debug info
+        if st.sidebar.checkbox("Show debug info"):
+            st.sidebar.write("Model status:", "Loaded" if predictor.model else "Not loaded")
+            st.sidebar.write("Data shape:", predictor.matches_df.shape)
+        
+        # Authentication flow
+        if 'logged_in' not in st.session_state:
+            st.session_state.logged_in = False
+            
+        if not st.session_state.logged_in:
+            show_login_page(predictor)
+        else:
+            show_prediction_page(predictor)
+            
+    except Exception as e:
+        st.error(f"Application error: {str(e)}")
+        st.stop()
+
+if __name__ == "__main__":
+    main()
