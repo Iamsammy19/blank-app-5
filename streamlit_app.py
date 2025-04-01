@@ -32,7 +32,7 @@ class FootballPredictor:
         self.model = None
         self.feature_names = []
         self.init_db()
-        self._load_data_initial()  # Changed to use the new loading approach
+        self._load_data_initial()
         self.load_model()
 
     def init_db(self):
@@ -129,34 +129,136 @@ class FootballPredictor:
             logging.error(f"Model error: {str(e)}")
             self.model = None
 
-    # ... (Keep all other existing methods like hash_password, authenticate_user, etc.)
+    def hash_password(self, password):
+        """Hash a password for storing."""
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-def main():
-    st.set_page_config(page_title="Football Predictor", page_icon="⚽", layout="wide")
+    def verify_password(self, stored_hash, provided_password):
+        """Verify a stored password against one provided by user"""
+        return bcrypt.checkpw(provided_password.encode('utf-8'), stored_hash.encode('utf-8'))
+
+    def create_user(self, username, password):
+        """Create a new user in the database"""
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            c = conn.cursor()
+            password_hash = self.hash_password(password)
+            try:
+                c.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                    (username, password_hash)
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                raise ValueError("Username already exists")
+            except Exception as e:
+                raise Exception(f"Failed to create user: {str(e)}")
+
+    def authenticate_user(self, username, password):
+        """Authenticate a user"""
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT password_hash FROM users WHERE username = ?",
+                (username,)
+            )
+            result = c.fetchone()
+            if result:
+                stored_hash = result[0]
+                return self.verify_password(stored_hash, password)
+            return False
+
+def show_login_page(predictor):
+    """Display login/registration interface"""
+    st.title("Football Predictor Login")
     
-    # Initialize predictor with error handling
-    try:
-        predictor = FootballPredictor()
-        
-        # Debug info
-        if st.sidebar.checkbox("Show debug info"):
-            st.sidebar.write("Model status:", "Loaded" if predictor.model else "Not loaded")
-            st.sidebar.write("Data shape:", predictor.matches_df.shape)
-        
-        # Authentication flow
-        if 'logged_in' not in st.session_state:
-            st.session_state.logged_in = False
+    tab1, tab2 = st.tabs(["Login", "Register"])
+    
+    with tab1:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
             
-        if not st.session_state.logged_in:
-            show_login_page(predictor)
-        else:
-            show_prediction_page(predictor)
+            if submitted:
+                if predictor.authenticate_user(username, password):
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.success("Login successful!")
+                    st.experimental_rerun()
+                else:
+                    st.error("Invalid credentials")
+
+    with tab2:
+        with st.form("register_form"):
+            new_username = st.text_input("New Username")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submitted = st.form_submit_button("Register")
             
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-        st.stop()
+            if submitted:
+                if new_password != confirm_password:
+                    st.error("Passwords don't match")
+                else:
+                    try:
+                        predictor.create_user(new_username, new_password)
+                        st.success("Registration successful! Please login.")
+                    except Exception as e:
+                        st.error(f"Registration failed: {str(e)}")
 
-# ... (Keep all your existing UI functions like show_login_page, show_prediction_page)
-
-if __name__ == "__main__":
-    main()
+def show_prediction_page(predictor):
+    """Display the main prediction interface"""
+    st.title(f"⚽ Football Predictor")
+    st.write(f"Welcome, {st.session_state.username}!")
+    
+    # Team selection
+    col1, col2 = st.columns(2)
+    with col1:
+        home_team = st.selectbox("Home Team", options=list(predictor.team_mapping.keys()))
+    with col2:
+        away_team = st.selectbox("Away Team", options=list(predictor.team_mapping.keys()))
+    
+    # Make prediction
+    if st.button("Predict Match Outcome"):
+        try:
+            if not predictor.model:
+                st.error("Prediction model not loaded")
+                return
+                
+            home_id = predictor.team_mapping[home_team]
+            away_id = predictor.team_mapping[away_team]
+            
+            # Get team form data
+            home_form = predictor.matches_df[
+                predictor.matches_df['home_team_api_id'] == home_id]['home_team_form'].mean()
+            away_form = predictor.matches_df[
+                predictor.matches_df['away_team_api_id'] == away_id]['away_team_form'].mean()
+            
+            # Prepare features
+            features = pd.DataFrame([[home_form, away_form]], 
+                                  columns=predictor.feature_names)
+            
+            # Predict
+            pred_home_goals = predictor.model.predict(features)[0]
+            pred_away_goals = pred_home_goals * 0.8  # Simple adjustment for away performance
+            
+            # Display results
+            st.subheader("Prediction Results")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Home Goals", f"{pred_home_goals:.1f}")
+            col2.metric("Away Goals", f"{pred_away_goals:.1f}")
+            col3.metric("Winner", 
+                       home_team if pred_home_goals > pred_away_goals else away_team if pred_away_goals > pred_home_goals else "Draw")
+            
+            # Poisson probabilities
+            st.subheader("Scoreline Probabilities")
+            max_goals = 5
+            prob_matrix = np.zeros((max_goals+1, max_goals+1))
+            
+            for i in range(max_goals+1):
+                for j in range(max_goals+1):
+                    prob_matrix[i,j] = poisson.pmf(i, pred_home_goals) * poisson.pmf(j, pred_away_goals)
+            
+            # Display as a dataframe
+            prob_df = pd.DataFrame(prob_matrix, 
+                                 index=[f"Home {i}" for i in
