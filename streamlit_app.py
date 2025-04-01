@@ -256,4 +256,141 @@ class FootballPredictor:
             raise ValueError("Teams cannot play themselves")
         return True
 
-    def predict_match(self, home_team: str, away_team:
+    def predict_match(self, home_team: str, away_team: str) -> Optional[Dict]:
+        """Generate match prediction with probabilities."""
+        try:
+            self._validate_teams(home_team, away_team)
+            
+            # Get prediction with bounds checking
+            home_goals, away_goals = self.model.predict(home_team, away_team)
+            home_goals = max(0, min(float(home_goals), 10))
+            away_goals = max(0, min(float(away_goals), 10))
+            
+            # Calculate Poisson probabilities
+            home_probs = poisson.pmf(np.arange(6), home_goals)
+            away_probs = poisson.pmf(np.arange(6), away_goals)
+            score_matrix = np.outer(home_probs, away_probs)
+            
+            # Normalize and calculate outcomes
+            score_matrix /= score_matrix.sum()
+            home_win = np.sum(np.tril(score_matrix, -1))
+            draw = np.sum(np.diag(score_matrix))
+            away_win = np.sum(np.triu(score_matrix, 1))
+            
+            return {
+                'home_team': home_team,
+                'away_team': away_team,
+                'expected_home_goals': round(home_goals, 2),
+                'expected_away_goals': round(away_goals, 2),
+                'home_win_prob': round(home_win * 100, 1),
+                'draw_prob': round(draw * 100, 1),
+                'away_win_prob': round(away_win * 100, 1),
+                'score_probs': score_matrix.round(4)
+            }
+            
+        except ValueError as e:
+            logging.warning(f"Prediction input error: {str(e)}")
+            st.error(f"Invalid prediction request: {str(e)}")
+        except Exception as e:
+            logging.error(f"Prediction failed: {str(e)}", exc_info=True)
+            st.error("Prediction service unavailable - try again later")
+        return None
+
+def main():
+    """Main application entry point."""
+    st.set_page_config(
+        page_title="Football Predictor Pro",
+        page_icon="⚽",
+        layout="wide"
+    )
+    
+    # Initialize session state
+    if 'predictor' not in st.session_state:
+        try:
+            st.session_state.predictor = FootballPredictor()
+        except RuntimeError as e:
+            st.error("System initialization failed. Please refresh the page.")
+            st.stop()
+    
+    display_ui(st.session_state.predictor)
+
+def display_ui(predictor: FootballPredictor) -> None:
+    """Render the application user interface."""
+    st.title("⚽ Football Predictor Pro")
+    
+    with st.sidebar:
+        st.header("System Status")
+        st.write(f"Teams loaded: {len(predictor.team_mapping)}")
+        st.write(f"Matches loaded: {len(predictor.matches_df)}")
+        st.write(f"Model type: {type(predictor.model).__name__}")
+        
+        if st.button("Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
+    
+    st.header("Match Prediction")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        home_team = st.selectbox(
+            "Select Home Team",
+            predictor.get_team_list(),
+            index=0
+        )
+    
+    with col2:
+        away_team = st.selectbox(
+            "Select Away Team",
+            predictor.get_team_list(),
+            index=1 if len(predictor.get_team_list()) > 1 else 0
+        )
+    
+    if st.button("Predict Match Outcome", type="primary"):
+        with st.spinner("Calculating prediction..."):
+            result = predictor.predict_match(home_team, away_team)
+            display_results(result)
+
+def display_results(result: Optional[Dict]) -> None:
+    """Display prediction results in the UI."""
+    if result is None:
+        return
+        
+    st.subheader(f"Prediction: {result['home_team']} vs {result['away_team']}")
+    
+    # Outcome probabilities
+    cols = st.columns(3)
+    cols[0].metric(
+        f"{result['home_team']} Win", 
+        f"{result['home_win_prob']}%"
+    )
+    cols[1].metric("Draw", f"{result['draw_prob']}%")
+    cols[2].metric(
+        f"{result['away_team']} Win", 
+        f"{result['away_win_prob']}%"
+    )
+    
+    # Expected score
+    st.markdown("### Expected Score")
+    st.write(
+        f"**{result['expected_home_goals']:.1f}** - **{result['expected_away_goals']:.1f}**"
+    )
+    
+    # Score probability matrix
+    st.markdown("### Score Probabilities")
+    prob_df = pd.DataFrame(
+        result['score_probs'][:5, :5] * 100,
+        columns=[f"Away {i}" for i in range(5)],
+        index=[f"Home {i}" for i in range(5)]
+    )
+    st.dataframe(
+        prob_df.style.format("{:.1f}%")
+        .background_gradient(cmap='Blues', axis=None)
+    )
+    
+    # Match history placeholder
+    st.markdown("### Recent Similar Matches")
+    st.info("Match history analysis coming soon!")
+
+if __name__ == "__main__":
+    main()
