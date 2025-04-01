@@ -13,3 +13,4 @@ joblib
 python-dotenv
 # Optional
 python-Levenshtein
+psutil 
