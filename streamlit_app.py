@@ -27,9 +27,9 @@ logging.basicConfig(filename='app.log', level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # API Keys with validation
-FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+FOOTBALL_DATA_API_KEY = os.getenv("7563e489e2c84b77a0e4f8d7116dc19c")
+ODDS_API_KEY = os.getenv("c9b67d8274042fb5755ad88c3a63eab7")
+WEATHER_API_KEY = os.getenv("7211261adbaa426eb66101750250104")
 for key, name in [(FOOTBALL_DATA_API_KEY, "Football Data"), 
                   (ODDS_API_KEY, "Odds"), 
                   (WEATHER_API_KEY, "Weather")]:
