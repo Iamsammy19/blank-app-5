@@ -53,6 +53,47 @@ class FootballPredictor:
         self.load_model()
         self._verify_environment()
 
+    def init_db(self):
+        """Initialize the SQLite database connection and setup."""
+        try:
+            # Ensure the database file exists at DB_PATH
+            if not DB_PATH.exists():
+                logging.info(f"Creating new database at {DB_PATH}")
+                # Download a source database if needed
+                for url in DB_SOURCES:
+                    try:
+                        urllib.request.urlretrieve(url, DB_PATH)
+                        logging.info(f"Database downloaded from {url}")
+                        break
+                    except Exception as e:
+                        logging.warning(f"Failed to download from {url}: {e}")
+                        continue
+                else:
+                    raise Exception("Failed to download database from all sources")
+            
+            # Connect to the database
+            self.conn = sqlite3.connect(DB_PATH)
+            self.cursor = self.conn.cursor()
+            logging.info(f"Database initialized at {DB_PATH}")
+            
+            # Optional: Create any necessary tables (adjust as per your schema)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS matches (
+                    id INTEGER PRIMARY KEY,
+                    date TEXT,
+                    home_team TEXT,
+                    away_team TEXT,
+                    home_goals INTEGER,
+                    away_goals INTEGER
+                )
+            """)
+            self.conn.commit()
+            
+        except Exception as e:
+            logging.error(f"Failed to initialize database: {e}")
+            st.error(f"Database error: {str(e)}")
+            raise
+
     def _verify_environment(self):
         """Environment checks with psutil fallback"""
         if self.is_cloud and not Path('/tmp').exists():
@@ -74,7 +115,7 @@ class FootballPredictor:
                 self.data_limit = 10_000
 
     # [Keep all other methods unchanged from previous implementation]
-    # init_db(), load_data(), _add_features(), load_model(), 
+    # load_data(), _add_features(), load_model(), 
     # _create_fallback_model(), authenticate_user(), etc.
 
 def main():
