@@ -94,9 +94,19 @@ class FootballPredictor:
                             away_goals INTEGER
                         )
                     """)
+                    # Add sample data
+                    sample_matches = [
+                        ('2023-01-01', 'Team A', 'Team B', 2, 1),
+                        ('2023-01-02', 'Team C', 'Team D', 0, 0),
+                        ('2023-01-03', 'Team E', 'Team F', 1, 3)
+                    ]
+                    cursor.executemany(
+                        "INSERT INTO matches (date, home_team, away_team, home_goals, away_goals) VALUES (?, ?, ?, ?, ?)",
+                        sample_matches
+                    )
                     conn.commit()
                     conn.close()
-                    logging.info(f"Fallback database created at {DB_PATH}")
+                    logging.info(f"Fallback database created at {DB_PATH} with sample data")
 
             # Connect to the database
             self.conn = sqlite3.connect(DB_PATH)
@@ -136,76 +146,93 @@ class FootballPredictor:
             if self.matches_df.empty:
                 logging.warning("No data found in matches table")
                 st.warning("No match data available in the database")
+                return False
             
             # Optional: Basic data validation or preprocessing
             required_columns = ['date', 'home_team', 'away_team', 'home_goals', 'away_goals']
             if not all(col in self.matches_df.columns for col in required_columns):
                 raise ValueError("Database missing required columns")
             
+            # Create team mapping for consistent team IDs
+            all_teams = pd.concat([self.matches_df['home_team'], self.matches_df['away_team']]).unique()
+            self.team_mapping = {team: idx for idx, team in enumerate(all_teams)}
+            
+            return True
+            
         except Exception as e:
             logging.error(f"Error loading data: {e}")
             st.error(f"Data loading error: {str(e)}")
             raise
 
-    def _verify_environment(self):
-        """Environment checks with psutil fallback"""
-        if self.is_cloud and not Path('/tmp').exists():
-            st.error("Invalid cloud filesystem configuration")
-            st.stop()
-            
-        if PSUTIL_AVAILABLE:
-            mem = psutil.virtual_memory()
-            st.session_state.available_mb = mem.available / (1024 ** 2)
-            if st.session_state.available_mb < 500:
-                st.warning(f"Low memory: {st.session_state.available_mb:.0f}MB available")
-        else:
-            # Lightweight memory check
-            try:
-                test_array = np.zeros((1000, 1000))  # ~8MB
-                del test_array
-            except MemoryError:
-                st.warning("Memory constraints detected - reducing functionality")
-                self.data_limit = 10_000
+    def load_model(self):
+        """Load the trained XGBoost model from file or create a fallback model."""
+        try:
+            if MODEL_PATH.exists():
+                logging.info(f"Loading model from {MODEL_PATH}")
+                # Verify the model file is valid
+                if MODEL_PATH.stat().st_size < 100:  # Minimum expected size
+                    raise ValueError("Model file appears corrupted")
+                    
+                with open(MODEL_PATH, 'rb') as f:
+                    self.model = joblib.load(f)
+                    
+                # Verify the loaded model has the predict method
+                if not hasattr(self.model, 'predict'):
+                    raise AttributeError("Loaded model missing predict method")
+                    
+                logging.info("Model loaded and validated")
+            else:
+                logging.warning(f"No model found at {MODEL_PATH}")
+                self._create_fallback_model()
+                
+        except (EOFError, ValueError) as e:
+            logging.error(f"Model file corrupted: {e}")
+            st.warning("Model file corrupted - using fallback")
+            self._create_fallback_model()
+        except Exception as e:
+            logging.error(f"Unexpected error loading model: {e}")
+            st.warning("Failed to load prediction model - using fallback")
+            self._create_fallback_model()
 
-    # [Keep all other methods unchanged from previous implementation]
-    # _add_features(), load_model(), _create_fallback_model(), authenticate_user(), etc.
-
-def main():
-    st.set_page_config(page_title="Football Predictor", page_icon="⚽", layout="wide")
-    
-    # Initialize session
-    if 'logged_in' not in st.session_state:
-        st.session_state.update({
-            'logged_in': False,
-            'username': None,
-            'login_attempts': 0,
-            'available_mb': 'Unknown'
-        })
-
-    try:
-        predictor = FootballPredictor()
+    def _create_fallback_model(self):
+        """Create a simple fallback model when no trained model is available."""
+        logging.info("Creating fallback model")
         
-        # Debug panel
-        if st.sidebar.checkbox("Show system info"):
-            st.sidebar.metric("Available Memory", f"{st.session_state.available_mb:.0f}MB")
-            st.sidebar.write(f"Data: {len(predictor.matches_df)} matches")
-            st.sidebar.write(f"Model: {type(predictor.model).__name__}")
-            
-            if st.sidebar.button("Refresh App"):
-                st.cache_data.clear()
-                st.rerun()
-        
-        # Authentication flow
-        if not st.session_state.logged_in:
-            show_login_page(predictor)
-        else:
-            show_prediction_page(predictor)
-            
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-        st.stop()
+        class FallbackModel:
+            def __init__(self, matches_df):
+                self.matches_df = matches_df
+                
+            def predict(self, home_team, away_team):
+                """Predict match outcome using historical averages."""
+                try:
+                    if self.matches_df.empty:
+                        return (1.5, 1.0)  # Default averages if no data
+                    
+                    # Calculate team-specific averages if available
+                    home_avg = self.matches_df[self.matches_df['home_team'] == home_team]['home_goals'].mean()
+                    away_avg = self.matches_df[self.matches_df['away_team'] == away_team]['away_goals'].mean()
+                    
+                    # Fall back to general averages if team-specific data not available
+                    if np.isnan(home_avg):
+                        home_avg = self.matches_df['home_goals'].mean()
+                    if np.isnan(away_avg):
+                        away_avg = self.matches_df['away_goals'].mean()
+                        
+                    return (home_avg, away_avg)
+                    
+                except Exception as e:
+                    logging.error(f"Fallback model prediction error: {e}")
+                    return (1.5, 1.0)  # Default averages if error occurs
+                    
+        self.model = FallbackModel(self.matches_df)
+        logging.warning("Using fallback prediction model")
 
-# [Keep your existing UI functions show_login_page() and show_prediction_page()]
-
-if __name__ == "__main__":
-    main()
+    def predict_match(self, home_team, away_team):
+        """Predict the outcome of a match between two teams."""
+        try:
+            if not hasattr(self, 'model') or self.model is None:
+                raise AttributeError("Prediction model not loaded")
+                
+            home_goals, away_goals = self.model.predict(home_team, away_team)
+            
+            # Convert to Poisson probabilities
