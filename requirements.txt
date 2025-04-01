@@ -11,7 +11,5 @@ scikit-learn
 plotly
 joblib
 python-dotenv
-psutil 
-tempfile 
 # Optional
 python-Levenshtein
