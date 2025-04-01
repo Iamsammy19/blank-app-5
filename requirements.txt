@@ -1,1 +1,15 @@
 streamlit
+pandas
+numpy
+scipy
+requests
+beautifulsoup4
+bcrypt
+fuzzywuzzy
+xgboost
+scikit-learn
+plotly
+joblib
+python-dotenv
+# Optional
+python-Levenshtein
