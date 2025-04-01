@@ -15,7 +15,8 @@ import urllib.request
 from datetime import datetime
 import time
 import threading
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
+import psutil
 
 # Configure logging
 logging.basicConfig(
@@ -26,19 +27,27 @@ logging.basicConfig(
 
 class FootballPredictor:
     def __init__(self):
+        """Initialize the football prediction system."""
         self.is_cloud = os.getenv('IS_STREAMLIT_CLOUD', False)
         self.data_limit = 10_000 if self.is_cloud else 50_000
         self.matches_df = pd.DataFrame()
         self.team_mapping: Dict[str, int] = {}
         self.model = None
         
-        self._init_db()
-        self._load_data()
-        self._load_model()
-        self._verify_environment()
-        
-        if self.is_cloud:
-            self._start_memory_watchdog()
+        # Initialize components with error handling
+        try:
+            self._init_db()
+            self._load_data()
+            self._load_model()
+            self._verify_environment()
+            
+            if self.is_cloud:
+                self._start_memory_watchdog()
+                
+            logging.info("FootballPredictor initialized successfully")
+        except Exception as e:
+            logging.critical(f"Initialization failed: {str(e)}", exc_info=True)
+            raise RuntimeError("System initialization failed") from e
 
     def _init_db(self) -> None:
         """Initialize and validate the database connection."""
@@ -79,15 +88,17 @@ class FootballPredictor:
                     
         except Exception as e:
             logging.critical(f"Database initialization failed: {str(e)}")
-            st.error("Critical system error - please try again later")
-            raise SystemExit(1)
+            st.error("Critical database error - please try again later")
+            raise
 
     def _load_sample_matches(self) -> None:
         """Load sample matches into empty database."""
         sample_data = [
             ('2023-01-01', 'Arsenal', 'Chelsea', 2, 1),
             ('2023-01-02', 'Man City', 'Liverpool', 1, 1),
-            ('2023-01-03', 'Tottenham', 'Man United', 0, 2)
+            ('2023-01-03', 'Tottenham', 'Man United', 0, 2),
+            ('2023-01-04', 'Newcastle', 'Aston Villa', 3, 0),
+            ('2023-01-05', 'Everton', 'Southampton', 1, 1)
         ]
         try:
             self.cursor.executemany(
@@ -118,9 +129,10 @@ class FootballPredictor:
             
             if self.matches_df.empty:
                 logging.warning("No match data found in database")
+                st.warning("Using limited sample data - predictions may be less accurate")
                 return False
                 
-            # Data validation
+            # Data validation and cleaning
             self.matches_df.dropna(inplace=True)
             self.matches_df = self.matches_df[
                 (self.matches_df['home_goals'] >= 0) & 
@@ -138,7 +150,7 @@ class FootballPredictor:
             
         except Exception as e:
             logging.error(f"Data loading failed: {str(e)}")
-            st.error("Failed to load match data")
+            st.error("Failed to load match data - using fallback mode")
             return False
 
     def _load_model(self) -> None:
@@ -172,28 +184,27 @@ class FootballPredictor:
         class FallbackModel:
             def __init__(self, matches_df: pd.DataFrame):
                 self.data = matches_df
-                self.home_avg = matches_df['home_goals'].mean()
-                self.away_avg = matches_df['away_goals'].mean()
+                self.home_avg = matches_df['home_goals'].mean() if not matches_df.empty else 1.5
+                self.away_avg = matches_df['away_goals'].mean() if not matches_df.empty else 1.0
                 
             def predict(self, home_team: str, away_team: str) -> Tuple[float, float]:
                 """Predict using team-specific averages or fallback to league averages."""
                 try:
-                    home_avg = self.data[
-                        self.data['home_team'] == home_team
-                    ]['home_goals'].mean()
+                    home_data = self.data[self.data['home_team'] == home_team]
+                    home_avg = home_data['home_goals'].mean() if not home_data.empty else np.nan
                     
-                    away_avg = self.data[
-                        self.data['away_team'] == away_team
-                    ]['away_goals'].mean()
+                    away_data = self.data[self.data['away_team'] == away_team]
+                    away_avg = away_data['away_goals'].mean() if not away_data.empty else np.nan
                     
                     return (
                         home_avg if not np.isnan(home_avg) else self.home_avg,
                         away_avg if not np.isnan(away_avg) else self.away_avg
                     )
-                except:
+                except Exception:
                     return (self.home_avg, self.away_avg)
                     
         self.model = FallbackModel(self.matches_df)
+        logging.info("Fallback model initialized")
 
     def _verify_environment(self) -> None:
         """Check system resources and constraints."""
@@ -209,6 +220,8 @@ class FootballPredictor:
         except MemoryError:
             logging.warning("Memory constraints detected")
             self.data_limit = 5_000
+            if not self.matches_df.empty:
+                self.matches_df = self.matches_df.sample(min(5000, len(self.matches_df)))
         except Exception as e:
             logging.warning(f"Environment verification failed: {str(e)}")
 
@@ -222,14 +235,25 @@ class FootballPredictor:
                         logging.critical("Memory limit exceeded - exiting")
                         os._exit(1)
                     time.sleep(30)
-                except:
+                except Exception:
                     pass
                     
         threading.Thread(target=watchdog, daemon=True).start()
+
+    def get_team_list(self) -> List[str]:
+        """Return sorted list of available teams."""
+        return sorted(self.team_mapping.keys())
 
     def _validate_teams(self, home_team: str, away_team: str) -> bool:
         """Validate team inputs before prediction."""
         if not all(isinstance(t, str) for t in [home_team, away_team]):
             raise ValueError("Team names must be strings")
         if home_team not in self.team_mapping:
-            raise ValueError(f"Unknown home team: {home_
+            raise ValueError(f"Unknown home team: {home_team}")
+        if away_team not in self.team_mapping:
+            raise ValueError(f"Unknown away team: {away_team}")
+        if home_team == away_team:
+            raise ValueError("Teams cannot play themselves")
+        return True
+
+    def predict_match(self, home_team: str, away_team:
