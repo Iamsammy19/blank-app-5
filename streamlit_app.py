@@ -41,15 +41,21 @@ INJURY_API_URL = "https://api.sportsdata.io/v3/soccer/scores/json/Injuries"
 class UltimateFootballPredictor:
     def __init__(self):
         """Initialize with comprehensive data sources"""
-        self.today_matches = []
-        self.odds_data = {}
-        self.injury_data = {}
-        self.weather_data = {}
-        self.stadium_data = self._load_stadium_data()
-        self.team_stats = {}
-        self.last_update = 0
-        self.model = self._load_or_train_model()
-        
+        try:
+            logging.info("Initializing UltimateFootballPredictor...")
+            self.today_matches = []
+            self.odds_data = {}
+            self.injury_data = {}
+            self.weather_data = {}
+            self.stadium_data = self._load_stadium_data()
+            self.team_stats = {}
+            self.last_update = 0
+            self.model = self._load_or_train_model()
+            logging.info("Predictor initialized successfully")
+        except Exception as e:
+            logging.error(f"Initialization failed: {str(e)}")
+            raise Exception(f"System initialization failed: {str(e)}")
+
     def _load_stadium_data(self) -> Dict:
         """Load stadium database with coordinates and features"""
         return {
@@ -67,7 +73,6 @@ class UltimateFootballPredictor:
                 'avg_goals': 2.6,
                 'home_advantage': 1.1
             },
-            # Add more stadiums as needed
         }
 
     def _load_or_train_model(self):
@@ -75,38 +80,54 @@ class UltimateFootballPredictor:
         try:
             model = joblib.load('ultimate_model.pkl')
             if hasattr(model, 'predict_proba'):
+                logging.info("Loaded existing model from ultimate_model.pkl")
                 return model
             raise ValueError("Model exists but isn't properly trained")
-        except:
-            logging.info("Training new model...")
+        except Exception as e:
+            logging.warning(f"Model loading failed: {str(e)}. Training new model...")
             return self._train_new_model()
 
     def _train_new_model(self):
         """Train a new predictive model"""
-        from sklearn.datasets import make_classification
-        X, y = make_classification(n_samples=10000, n_features=20)
-        model = RandomForestClassifier(n_estimators=200, max_depth=5)
-        model.fit(X, y)
-        joblib.dump(model, 'ultimate_model.pkl')
-        return model
+        try:
+            from sklearn.datasets import make_classification
+            X, y = make_classification(n_samples=10000, n_features=20)
+            model = RandomForestClassifier(n_estimators=200, max_depth=5)
+            model.fit(X, y)
+            joblib.dump(model, 'ultimate_model.pkl')
+            logging.info("New model trained and saved")
+            return model
+        except Exception as e:
+            logging.error(f"Model training failed: {str(e)}")
+            raise
 
     def fetch_all_data(self):
         """Fetch all required data with error handling"""
-        results = {
-            'matches': self._fetch_daily_matches(),
-            'odds': self._fetch_odds_data(),
-            'injuries': self._fetch_injury_data(),
-            'weather': self._fetch_weather_data(),
-            'stats': self._fetch_team_stats()
-        }
+        try:
+            logging.info("Fetching all data...")
+            results = {
+                'matches': self._fetch_daily_matches(),
+                'odds': self._fetch_odds_data(),
+                'injuries': self._fetch_injury_data(),
+                'weather': self._fetch_weather_data(),
+                'stats': self._fetch_team_stats()
+            }
 
-        if not all(results.values()):
-            failed = [k for k, v in results.items() if not v]
-            logging.warning(f"Partial data load - failed: {failed}")
-            st.warning(f"Partial data loaded - some features may be limited")
+            if not any(results.values()):
+                logging.error("All data fetches failed")
+                return False
 
-        self.last_update = time.time()
-        return any(results.values())
+            if not all(results.values()):
+                failed = [k for k, v in results.items() if not v]
+                logging.warning(f"Partial data load - failed: {failed}")
+                st.warning(f"Partial data loaded - failed components: {', '.join(failed)}")
+
+            self.last_update = time.time()
+            logging.info("Data fetch completed")
+            return True
+        except Exception as e:
+            logging.error(f"fetch_all_data failed: {str(e)}")
+            return False
 
     def _fetch_daily_matches(self) -> bool:
         """Fetch today's matches with retry logic"""
@@ -138,6 +159,7 @@ class UltimateFootballPredictor:
                 venue = match.get('venue', 'Unknown')
                 match['stadium'] = self.stadium_data.get(venue, {})
             
+            logging.info(f"Fetched {len(self.today_matches)} matches")
             return len(self.today_matches) > 0
             
         except Exception as e:
@@ -161,6 +183,7 @@ class UltimateFootballPredictor:
                     'spreads': item['bookmakers'][0]['markets'][2]['outcomes']
                 } for item in response.json()
             }
+            logging.info("Odds data fetched successfully")
             return True
             
         except Exception as e:
@@ -201,6 +224,7 @@ class UltimateFootballPredictor:
                     'injury_type': injury.get('InjuryType', 'Not Specified')
                 })
                 
+            logging.info("Injury data fetched successfully")
             return True
             
         except Exception as e:
@@ -219,6 +243,7 @@ class UltimateFootballPredictor:
                     "injury_type": "Knee"
                 }]
             }
+            logging.info("Using fallback injury data")
             return False
 
     def _fetch_weather_data(self) -> bool:
@@ -262,6 +287,7 @@ class UltimateFootballPredictor:
                             }
                             break
             
+            logging.info(f"Weather data fetched for {len(self.weather_data)} venues")
             return len(self.weather_data) > 0
             
         except Exception as e:
@@ -290,6 +316,7 @@ class UltimateFootballPredictor:
                         stats = self._calculate_advanced_stats(matches, team_id)
                         self.team_stats[team_id] = stats
             
+            logging.info("Team stats fetched successfully")
             return True
             
         except Exception as e:
@@ -715,7 +742,9 @@ def main():
             with st.spinner("Initializing system..."):
                 st.session_state.predictor = UltimateFootballPredictor()
                 if not st.session_state.predictor.fetch_all_data():
-                    st.error("Initial data load failed - some features may be limited")
+                    st.warning("Initial data load partially failed - some features may be limited")
+                else:
+                    st.success("System initialized successfully")
         
         predictor = st.session_state.predictor
         
@@ -731,17 +760,18 @@ def main():
                     st.cache_data.clear()
                     st.rerun()
         
-        # Authentication flow (reusing your original structure)
+        # Authentication flow
         if not st.session_state.logged_in:
-            show_login_page(predictor)  # Assumes this function exists
+            show_login_page(predictor)
         else:
-            show_prediction_page(predictor)  # Assumes this function exists
+            show_prediction_page(predictor)
             
     except Exception as e:
-        st.error(f"Application error: {str(e)}")
+        logging.error(f"Main loop error: {str(e)}")
+        st.error(f"System initialization failed: {str(e)}. Please refresh the page or try again later.")
         st.stop()
 
-# Placeholder for missing UI functions
+# Placeholder UI functions
 def show_login_page(predictor):
     st.write("Login page placeholder - please implement authentication logic.")
     if st.button("Login (Demo)"):
@@ -752,7 +782,7 @@ def show_prediction_page(predictor):
     st.write("Prediction page placeholder - displaying predictor output.")
     predictions = predictor.predict_all_matches()
     for pred in predictions:
-        st.json(pred)  # Simple display; replace with your UI logic
+        st.json(pred)
 
 if __name__ == "__main__":
     main()
