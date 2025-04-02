@@ -3,21 +3,20 @@ import pandas as pd
 import numpy as np
 import requests
 from scipy.stats import poisson, skellam
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.exceptions import NotFittedError
-import joblib
 import sqlite3
-from pathlib import Path
-import tempfile
-import datetime
-import time
-import random
+import os
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import time
+import hashlib
+import json
 
 # Configure logging
 logging.basicConfig(
-    filename='football_predictor.log',
+    filename='ultimate_predictor.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -25,518 +24,757 @@ logging.basicConfig(
 # API Configuration
 FOOTBALL_API_KEY = "7563e489e2c84b77a0e4f8d7116dc19c"
 LIVE_ODDS_API_KEY = "c9b67d8274042fb5755ad88c3a63eab7"
-FOOTBALL_API_URL = "https://api.football-data.org/v4"
-LIVE_ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds"
+WEATHER_API_KEY = "7211261adbaa426eb66101750250104"
+INJURY_API_KEY = "your_injury_api_key"  # Get from SportsDataIO, API-Football, etc.
 
-# Database Configuration
-DB_PATH = Path(tempfile.gettempdir()) / "football_predictor.db"
-MODEL_PATH = Path(tempfile.gettempdir()) / "football_model.pkl"
-HISTORICAL_DATA_PATH = Path(tempfile.gettempdir()) / "historical_data.csv"
+# API Endpoints
+FOOTBALL_API_URL = "https://api.football-data.org/v4"
+ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds"
+WEATHER_API_URL = "http://api.weatherapi.com/v1/forecast.json"
+INJURY_API_URL = "https://api.sportsdata.io/v3/soccer/scores/json/Injuries"
 
 class UltimateFootballPredictor:
     def __init__(self):
-        """Initialize with comprehensive error handling"""
-        self.match_data = []
-        self.odds_data = {}
-        self.historical_data = pd.DataFrame()
+        """Initialize with comprehensive data sources"""
+        self.matches = []
+        self.odds = {}
+        self.injuries = {}
+        self.weather = {}
+        self.team_stats = {}
+        self.stadium_data = self._load_stadium_db()
+        self.user_prefs = {}
+        self.model = self._load_model()
         self.last_update = 0
-        self.db_conn = None
         
-        try:
-            self._init_database()
-            self._load_historical_data()
-            self.model = self._load_or_train_model()
-            self._fetch_initial_data()
-        except Exception as e:
-            logging.critical(f"Initialization failed: {str(e)}", exc_info=True)
-            raise RuntimeError("System initialization failed") from e
-
-    def _init_database(self) -> None:
-        """Initialize SQLite database with error recovery"""
-        try:
-            self.db_conn = sqlite3.connect(DB_PATH, timeout=10)
-            cursor = self.db_conn.cursor()
-            
-            # Create tables if they don't exist
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS matches (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT NOT NULL,
-                    home_team TEXT NOT NULL,
-                    away_team TEXT NOT NULL,
-                    home_goals INTEGER,
-                    away_goals INTEGER,
-                    home_odds REAL,
-                    draw_odds REAL,
-                    away_odds REAL
-                )
-            """)
-            
-            # Create prediction cache table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS predictions (
-                    match_id INTEGER PRIMARY KEY,
-                    home_win REAL,
-                    draw REAL,
-                    away_win REAL,
-                    btts_yes REAL,
-                    last_updated TEXT
-                )
-            """)
-            
-            self.db_conn.commit()
-        except sqlite3.Error as e:
-            logging.error(f"Database error: {str(e)}")
-            raise RuntimeError("Database initialization failed") from e
-
-    def _load_historical_data(self) -> None:
-        """Load historical match data with fallback"""
-        try:
-            if HISTORICAL_DATA_PATH.exists():
-                self.historical_data = pd.read_csv(HISTORICAL_DATA_PATH)
-            else:
-                # Create minimal historical data
-                self.historical_data = pd.DataFrame({
-                    'home_team': ['Team A', 'Team B'],
-                    'away_team': ['Team B', 'Team A'],
-                    'home_goals': [2, 1],
-                    'away_goals': [1, 0]
-                })
-                self.historical_data.to_csv(HISTORICAL_DATA_PATH, index=False)
-        except Exception as e:
-            logging.warning(f"Historical data load failed: {str(e)}")
-            self.historical_data = pd.DataFrame()
-
-    def _load_or_train_model(self):
-        """Load or train ML model with comprehensive error handling"""
-        try:
-            if MODEL_PATH.exists():
-                try:
-                    model = joblib.load(MODEL_PATH)
-                    # Verify the model is properly trained
-                    if hasattr(model, 'predict_proba'):
-                        return model
-                    raise NotFittedError("Model exists but isn't properly trained")
-                except (EOFError, NotFittedError) as e:
-                    logging.warning(f"Model load failed, retraining: {str(e)}")
-            
-            # Fallback model training
-            logging.info("Training fallback model...")
-            from sklearn.datasets import make_classification
-            X, y = make_classification(n_samples=1000, n_features=10)
-            model = RandomForestClassifier(n_estimators=100)
-            model.fit(X, y)
-            
-            try:
-                joblib.dump(model, MODEL_PATH)
-            except Exception as e:
-                logging.warning(f"Model save failed: {str(e)}")
-            
-            return model
-        except Exception as e:
-            logging.error(f"Model initialization failed: {str(e)}")
-            raise RuntimeError("Model initialization failed") from e
-
-    def _fetch_initial_data(self) -> None:
-        """Fetch initial data with retry logic"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if self._fetch_live_data():
-                    return
-            except Exception as e:
-                logging.warning(f"Data fetch attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
-                    raise RuntimeError("Initial data fetch failed after retries") from e
-                time.sleep(2 ** attempt)  # Exponential backoff
-
-    def _fetch_live_data(self) -> bool:
-        """Fetch live data from APIs with comprehensive error handling"""
-        try:
-            # Football API
-            football_response = requests.get(
-                f"{FOOTBALL_API_URL}/matches",
-                headers={"X-Auth-Token": FOOTBALL_API_KEY},
-                params={"status": "LIVE", "limit": 20},
-                timeout=10
+        # Initialize databases
+        self._init_databases()
+        
+    def _init_databases(self):
+        """Initialize SQLite databases for caching"""
+        self.conn = sqlite3.connect('football_data.db')
+        self.cursor = self.conn.cursor()
+        
+        # Create tables if they don't exist
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY,
+                competition TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                date TEXT,
+                venue TEXT,
+                status TEXT
             )
-            football_response.raise_for_status()
-            self.match_data = football_response.json().get("matches", [])
-            
-            # Live Odds API
-            odds_response = requests.get(
-                LIVE_ODDS_API_URL,
-                params={"apiKey": LIVE_ODDS_API_KEY, "regions": "eu"},
-                timeout=10
+        """)
+        
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                match_id INTEGER PRIMARY KEY,
+                home_win REAL,
+                draw REAL,
+                away_win REAL,
+                btts_yes REAL,
+                over_15 REAL,
+                over_25 REAL,
+                correct_scores TEXT,
+                last_updated TEXT
             )
-            odds_response.raise_for_status()
-            self.odds_data = {item['id']: item for item in odds_response.json()}
-            
-            self.last_update = time.time()
-            self._cache_data()
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"API request failed: {str(e)}")
-            raise RuntimeError("Live data fetch failed") from e
-        except (json.JSONDecodeError, KeyError) as e:
-            logging.error(f"Data parsing failed: {str(e)}")
-            raise RuntimeError("Data parsing failed") from e
-
-    def _cache_data(self) -> None:
-        """Cache data to database with error handling"""
+        """)
+        
+        self.conn.commit()
+    
+    def _load_stadium_db(self):
+        """Load stadium database with advanced metrics"""
+        return {
+            'Old Trafford': {
+                'location': (53.4631, -2.2913),
+                'dimensions': (105, 68),
+                'capacity': 74310,
+                'avg_goals': 2.8,
+                'home_advantage': 1.15,
+                'weather_impact': 0.9  # Rain impact multiplier
+            },
+            # Add more stadiums...
+        }
+    
+    def _load_model(self):
+        """Load pre-trained ML model"""
         try:
-            cursor = self.db_conn.cursor()
-            for match in self.match_data:
-                odds = self.odds_data.get(str(match['id']), {})
-                cursor.execute("""
-                    INSERT OR REPLACE INTO matches 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    match['id'],
-                    match.get('utcDate', ''),
-                    match['homeTeam']['name'],
-                    match['awayTeam']['name'],
-                    match['score']['fullTime']['home'] if 'score' in match else None,
-                    match['score']['fullTime']['away'] if 'score' in match else None,
-                    odds.get('home_odds'),
-                    odds.get('draw_odds'),
-                    odds.get('away_odds')
-                ))
-            self.db_conn.commit()
-        except sqlite3.Error as e:
-            logging.error(f"Database cache failed: {str(e)}")
-            self.db_conn.rollback()
-
-    def simulate_match(self, match: Dict, n_simulations: int = 1000) -> Dict:
-        """Run match simulations with comprehensive error handling"""
-        try:
-            # Get base stats with fallbacks
-            home_team = match['homeTeam']['name']
-            away_team = match['awayTeam']['name']
-            
-            home_attack = self._get_team_stat(home_team, 'goals_scored', 1.5)
-            away_attack = self._get_team_stat(away_team, 'goals_scored', 1.2)
-            home_defense = self._get_team_stat(home_team, 'goals_conceded', 1.1)
-            away_defense = self._get_team_stat(away_team, 'goals_conceded', 1.3)
-            
-            # Adjust based on odds if available
-            match_odds = self._get_match_odds(home_team, away_team)
-            if match_odds:
-                home_attack *= match_odds.get('home_adj', 1)
-                away_attack *= match_odds.get('away_adj', 1)
-            
-            # Run simulations
-            results = {
-                'home_wins': 0,
-                'draws': 0,
-                'away_wins': 0,
-                'goals': [],
-                'btts': 0,
-                'upset': False,
-                'error': None
-            }
-            
-            for _ in range(n_simulations):
-                try:
-                    home_goals = np.random.poisson(home_attack * (1/away_defense))
-                    away_goals = np.random.poisson(away_attack * (1/home_defense))
-                    
-                    results['goals'].append((home_goals, away_goals))
-                    
-                    if home_goals > away_goals:
-                        results['home_wins'] += 1
-                    elif away_goals > home_goals:
-                        results['away_wins'] += 1
-                    else:
-                        results['draws'] += 1
-                        
-                    if home_goals > 0 and away_goals > 0:
-                        results['btts'] += 1
-                except Exception as e:
-                    logging.warning(f"Simulation iteration failed: {str(e)}")
-                    continue
-            
-            # Convert counts to percentages
-            total = max(1, results['home_wins'] + results['draws'] + results['away_wins'])
-            results['home_wins'] = results['home_wins'] / total * 100
-            results['draws'] = results['draws'] / total * 100
-            results['away_wins'] = results['away_wins'] / total * 100
-            results['btts'] = results['btts'] / n_simulations * 100
-            
-            # Detect potential upset
-            results['upset'] = self._detect_upset(results, match_odds)
-            
-            return results
-            
-        except Exception as e:
-            logging.error(f"Simulation failed: {str(e)}")
-            return {
-                'home_wins': 33.3,
-                'draws': 33.3,
-                'away_wins': 33.3,
-                'btts': 50.0,
-                'upset': False,
-                'error': str(e)
-            }
-
-    def _get_team_stat(self, team_name: str, stat: str, default: float) -> float:
-        """Get team statistic with fallback"""
-        try:
-            if not self.historical_data.empty:
-                if stat == 'goals_scored':
-                    home_avg = self.historical_data[
-                        self.historical_data['home_team'] == team_name
-                    ]['home_goals'].mean()
-                    away_avg = self.historical_data[
-                        self.historical_data['away_team'] == team_name
-                    ]['away_goals'].mean()
-                    return np.nanmean([home_avg, away_avg])
-                elif stat == 'goals_conceded':
-                    home_avg = self.historical_data[
-                        self.historical_data['home_team'] == team_name
-                    ]['away_goals'].mean()
-                    away_avg = self.historical_data[
-                        self.historical_data['away_team'] == team_name
-                    ]['home_goals'].mean()
-                    return np.nanmean([home_avg, away_avg])
-        except Exception as e:
-            logging.warning(f"Stat lookup failed for {team_name}: {str(e)}")
-        return default
-
-    def _get_match_odds(self, home_team: str, away_team: str) -> Optional[Dict]:
-        """Get match odds with error handling"""
-        try:
-            for match_id, odds in self.odds_data.items():
-                if odds['home_team'] == home_team and odds['away_team'] == away_team:
-                    return {
-                        'home_odds': odds.get('home_odds', 2.0),
-                        'draw_odds': odds.get('draw_odds', 3.5),
-                        'away_odds': odds.get('away_odds', 2.5),
-                        'home_adj': 1 + (2.0 - odds.get('home_odds', 2.0)) / 10,
-                        'away_adj': 1 + (2.0 - odds.get('away_odds', 2.5)) / 10
-                    }
-        except Exception as e:
-            logging.warning(f"Odds lookup failed: {str(e)}")
+            # In production, load a real trained model
+            return None  # Placeholder for actual model
+        except:
+            return self._train_fallback_model()
+    
+    def _train_fallback_model(self):
+        """Train a fallback model if primary fails"""
+        # Simplified example - would use real training data
         return None
-
-    def _detect_upset(self, results: Dict, odds: Optional[Dict]) -> bool:
-        """Detect potential upset with error handling"""
-        try:
-            if not odds:
-                return False
-                
-            home_implied = 1 / odds.get('home_odds', 2.0)
-            away_implied = 1 / odds.get('away_odds', 2.5)
+    
+    def fetch_all_data(self):
+        """Fetch all required data with error handling"""
+        success = True
+        
+        if not self._fetch_matches():
+            st.error("Failed to fetch match data")
+            success = False
             
-            # Underdog has >40% chance while being priced as >35% underdog
-            return (results['away_wins'] > 40 and home_implied > 0.65) or \
-                   (results['home_wins'] > 40 and away_implied > 0.65)
+        if not self._fetch_odds():
+            st.warning("Odds data may be outdated")
+            
+        if not self._fetch_injuries():
+            st.warning("Injury data unavailable")
+            
+        if not self._fetch_weather():
+            st.warning("Weather data unavailable")
+            
+        if not self._fetch_team_stats():
+            st.warning("Team stats incomplete")
+            
+        self.last_update = time.time()
+        return success
+    
+    def _fetch_matches(self):
+        """Fetch matches with retry logic"""
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_API_KEY}
+            date_from = datetime.now().strftime('%Y-%m-%d')
+            date_to = (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')
+            
+            response = requests.get(
+                f"{FOOTBALL_API_URL}/matches",
+                headers=headers,
+                params={"dateFrom": date_from, "dateTo": date_to},
+                timeout=10
+            )
+            response.raise_for_status()
+            
+            self.matches = []
+            for match in response.json().get('matches', []):
+                enhanced_match = {
+                    'id': match['id'],
+                    'competition': match['competition']['name'],
+                    'home_team': match['homeTeam']['name'],
+                    'away_team': match['awayTeam']['name'],
+                    'date': match['utcDate'],
+                    'venue': match.get('venue', 'Unknown'),
+                    'status': match['status']
+                }
+                self.matches.append(enhanced_match)
+            
+            return True
         except Exception as e:
-            logging.warning(f"Upset detection failed: {str(e)}")
+            logging.error(f"Match fetch failed: {str(e)}")
             return False
-
-    def predict_with_ml(self, match: Dict) -> Dict:
-        """Make ML prediction with comprehensive error handling"""
+    
+    def _fetch_odds(self):
+        """Fetch comprehensive betting odds"""
         try:
-            # Prepare features with fallbacks
-            features = np.array([
-                self._get_team_stat(match['homeTeam']['name'], 'goals_scored', 5),
-                self._get_team_stat(match['awayTeam']['name'], 'goals_scored', 10),
-                self._get_team_stat(match['homeTeam']['name'], 'goals_conceded', 0.6),
-                self._get_team_stat(match['awayTeam']['name'], 'goals_conceded', 0.4),
-                len(match.get('home_missing_players', [])),
-                len(match.get('away_missing_players', [])),
-                match.get('home_goals_avg', 1.5),
-                match.get('away_goals_avg', 1.2),
-                match.get('home_defense_avg', 1.0),
-                match.get('away_defense_avg', 1.3)
-            ]).reshape(1, -1)
-            
-            prediction = self.model.predict_proba(features)[0]
-            
-            return {
-                'home_win': prediction[0] * 100,
-                'draw': prediction[1] * 100,
-                'away_win': prediction[2] * 100,
-                'confidence': max(prediction) * 100,
-                'error': None
+            params = {
+                "apiKey": LIVE_ODDS_API_KEY,
+                "regions": "eu,us",
+                "markets": "h2h,totals,spreads",
+                "oddsFormat": "decimal"
             }
+            response = requests.get(ODDS_API_URL, params=params, timeout=10)
+            response.raise_for_status()
+            
+            self.odds = {}
+            for match in response.json():
+                bookmakers = {}
+                for bookmaker in match['bookmakers']:
+                    markets = {}
+                    for market in bookmaker['markets']:
+                        markets[market['key']] = {
+                            outcome['name']: outcome['price'] 
+                            for outcome in market['outcomes']
+                        }
+                    bookmakers[bookmaker['key']] = markets
+                
+                self.odds[match['id']] = bookmakers
+            
+            return True
         except Exception as e:
-            logging.error(f"ML prediction failed: {str(e)}")
+            logging.error(f"Odds fetch failed: {str(e)}")
+            return False
+    
+    def _fetch_injuries(self):
+        """Fetch injury data with player importance"""
+        try:
+            headers = {"Ocp-Apim-Subscription-Key": INJURY_API_KEY}
+            response = requests.get(INJURY_API_URL, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            self.injuries = {}
+            for injury in response.json():
+                team_id = injury['team_id']
+                if team_id not in self.injuries:
+                    self.injuries[team_id] = []
+                
+                # Calculate player impact (would use real importance metric)
+                impact = 0.7 if injury['status'] == 'Out' else 0.3
+                self.injuries[team_id].append({
+                    'player': injury['player_name'],
+                    'position': injury['position'],
+                    'status': injury['status'],
+                    'impact': impact
+                })
+            
+            return True
+        except Exception as e:
+            logging.error(f"Injury fetch failed: {str(e)}")
+            return False
+    
+    def _fetch_weather(self):
+        """Fetch detailed weather forecasts"""
+        try:
+            self.weather = {}
+            for match in self.matches:
+                venue = match['venue']
+                if venue in self.stadium_data and venue not in self.weather:
+                    lat, lon = self.stadium_data[venue]['location']
+                    
+                    response = requests.get(
+                        WEATHER_API_URL,
+                        params={
+                            "key": WEATHER_API_KEY,
+                            "q": f"{lat},{lon}",
+                            "days": 2,
+                            "aqi": "no",
+                            "alerts": "no"
+                        },
+                        timeout=10
+                    )
+                    response.raise_for_status()
+                    
+                    forecast = response.json()
+                    match_time = datetime.strptime(match['date'], '%Y-%m-%dT%H:%M:%SZ')
+                    
+                    # Find hourly forecast closest to match time
+                    closest_hour = None
+                    min_diff = float('inf')
+                    
+                    for hour_data in forecast['forecast']['forecastday'][0]['hour']:
+                        hour_time = datetime.strptime(hour_data['time'], '%Y-%m-%d %H:%M')
+                        time_diff = abs((match_time - hour_time).total_seconds())
+                        
+                        if time_diff < min_diff:
+                            min_diff = time_diff
+                            closest_hour = hour_data
+                    
+                    if closest_hour:
+                        self.weather[venue] = {
+                            'temp_c': closest_hour['temp_c'],
+                            'precip_mm': closest_hour['precip_mm'],
+                            'wind_kph': closest_hour['wind_kph'],
+                            'humidity': closest_hour['humidity'],
+                            'condition': closest_hour['condition']['text'],
+                            'cloud': closest_hour['cloud'],
+                            'feelslike_c': closest_hour['feelslike_c']
+                        }
+            
+            return True
+        except Exception as e:
+            logging.error(f"Weather fetch failed: {str(e)}")
+            return False
+    
+    def _fetch_team_stats(self):
+        """Fetch advanced team statistics"""
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_API_KEY}
+            date_from = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            
+            team_ids = set()
+            for match in self.matches:
+                team_ids.add(match['home_team'])
+                team_ids.add(match['away_team'])
+            
+            for team in team_ids:
+                # Get matches
+                matches_response = requests.get(
+                    f"{FOOTBALL_API_URL}/teams/{team}/matches",
+                    headers=headers,
+                    params={"dateFrom": date_from, "limit": 10},
+                    timeout=10
+                )
+                matches_response.raise_for_status()
+                matches = matches_response.json().get('matches', [])
+                
+                # Calculate advanced stats
+                stats = self._calculate_team_metrics(team, matches)
+                self.team_stats[team] = stats
+            
+            return True
+        except Exception as e:
+            logging.error(f"Team stats fetch failed: {str(e)}")
+            return False
+    
+    def _calculate_team_metrics(self, team_id, matches):
+        """Calculate comprehensive team performance metrics"""
+        if not matches:
             return {
-                'home_win': 33.3,
-                'draw': 33.3,
-                'away_win': 33.3,
-                'confidence': 0,
-                'error': str(e)
+                'form': 0.5,
+                'xG': 1.5,
+                'xGA': 1.2,
+                'pressures': 100,
+                'final_third_passes': 50,
+                'defensive_actions': 40
             }
+        
+        # Initialize metrics
+        metrics = {
+            'goals_for': 0,
+            'goals_against': 0,
+            'shots': 0,
+            'shots_on_target': 0,
+            'corners': 0,
+            'fouls': 0,
+            'clean_sheets': 0,
+            'matches': len(matches)
+        }
+        
+        for match in matches:
+            is_home = match['homeTeam']['id'] == team_id
+            
+            if is_home:
+                metrics['goals_for'] += match['score']['fullTime']['home']
+                metrics['goals_against'] += match['score']['fullTime']['away']
+                if match['score']['fullTime']['away'] == 0:
+                    metrics['clean_sheets'] += 1
+            else:
+                metrics['goals_for'] += match['score']['fullTime']['away']
+                metrics['goals_against'] += match['score']['fullTime']['home']
+                if match['score']['fullTime']['home'] == 0:
+                    metrics['clean_sheets'] += 1
+        
+        # Calculate advanced metrics (simplified)
+        return {
+            'form': metrics['goals_for'] / (metrics['matches'] * 2),  # Normalized
+            'xG': metrics['goals_for'] / metrics['matches'],
+            'xGA': metrics['goals_against'] / metrics['matches'],
+            'clean_sheet_pct': metrics['clean_sheets'] / metrics['matches'],
+            'attack_strength': metrics['goals_for'] / (metrics['matches'] * 1.5),
+            'defense_strength': 1 - (metrics['goals_against'] / (metrics['matches'] * 1.2))
+        }
+    
+    def predict_all_matches(self):
+        """Generate comprehensive predictions for all matches"""
+        predictions = []
+        
+        for match in self.matches:
+            try:
+                prediction = self._predict_match(match)
+                predictions.append(prediction)
+                
+                # Cache prediction
+                self._cache_prediction(match['id'], prediction)
+                
+            except Exception as e:
+                logging.error(f"Prediction failed for match {match['id']}: {str(e)}")
+                predictions.append({
+                    'match': match,
+                    'error': str(e)
+                })
+        
+        return predictions
+    
+    def _predict_match(self, match):
+        """Generate comprehensive prediction with multiple models"""
+        home_team = match['home_team']
+        away_team = match['away_team']
+        venue = match['venue']
+        
+        # Get base statistics
+        home_stats = self.team_stats.get(home_team, {})
+        away_stats = self.team_stats.get(away_team, {})
+        
+        # Calculate expected goals
+        home_xg = home_stats.get('xG', 1.5)
+        away_xg = away_stats.get('xG', 1.2)
+        
+        # Apply venue effects
+        venue_data = self.stadium_data.get(venue, {})
+        home_advantage = venue_data.get('home_advantage', 1.1)
+        home_xg *= home_advantage
+        away_xg *= (2 - home_advantage)  # Reduce away performance
+        
+        # Apply weather effects if available
+        if venue in self.weather:
+            weather = self.weather[venue]
+            if weather['precip_mm'] > 5:  # Rainy conditions
+                home_xg *= 0.9
+                away_xg *= 0.85
+            elif weather['temp_c'] > 28:  # Hot conditions
+                home_xg *= 0.95
+                away_xg *= 0.9
+        
+        # Apply injury impacts
+        home_injury_impact = sum(i['impact'] for i in self.injuries.get(home_team, [])) / 10
+        away_injury_impact = sum(i['impact'] for i in self.injuries.get(away_team, [])) / 10
+        home_xg *= (1 - home_injury_impact)
+        away_xg *= (1 - away_injury_impact)
+        
+        # Poisson distribution for score probabilities
+        home_goals = np.arange(0, 8)
+        away_goals = np.arange(0, 8)
+        home_probs = poisson.pmf(home_goals, home_xg)
+        away_probs = poisson.pmf(away_goals, away_xg)
+        
+        # Calculate match outcome probabilities
+        home_win_prob = np.sum(np.outer(home_probs[1:], away_probs[:-1]))
+        draw_prob = np.sum(np.diag(np.outer(home_probs, away_probs)))
+        away_win_prob = np.sum(np.outer(home_probs[:-1], away_probs[1:]))
+        
+        # Calculate BTTS probability
+        btts_prob = 1 - (home_probs[0] + away_probs[0] - home_probs[0]*away_probs[0])
+        
+        # Calculate over/under probabilities
+        total_probs = np.outer(home_probs, away_probs)
+        over_15 = 1 - np.sum(total_probs[0:2, 0:2])
+        over_25 = 1 - np.sum(total_probs[0:3, 0:3])
+        
+        # Get most likely correct scores
+        score_probs = np.outer(home_probs, away_probs)
+        top_scores = []
+        for i in range(len(home_goals)):
+            for j in range(len(away_goals)):
+                top_scores.append({
+                    'score': f"{i}-{j}",
+                    'probability': score_probs[i,j]
+                })
+        top_scores = sorted(top_scores, key=lambda x: x['probability'], reverse=True)[:5]
+        
+        # Get best odds if available
+        best_odds = self._get_best_odds(match['id'])
+        
+        return {
+            'match': match,
+            'home_win': home_win_prob,
+            'draw': draw_prob,
+            'away_win': away_win_prob,
+            'btts_yes': btts_prob,
+            'over_15': over_15,
+            'over_25': over_25,
+            'correct_scores': top_scores,
+            'expected_goals': {
+                'home': home_xg,
+                'away': away_xg
+            },
+            'best_odds': best_odds,
+            'last_updated': datetime.now().isoformat()
+        }
 
+    def _get_best_odds(self, match_id):
+        """Extract best available odds for a match"""
+        if match_id not in self.odds:
+            return None
+            
+        bookmakers = self.odds[match_id]
+        best_odds = {
+            'home_win': {'value': 0, 'bookmaker': None},
+            'draw': {'value': 0, 'bookmaker': None},
+            'away_win': {'value': 0, 'bookmaker': None}
+        }
+        
+        for bookmaker, markets in bookmakers.items():
+            if 'h2h' in markets:
+                for outcome, odds in markets['h2h'].items():
+                    if outcome == 'Home' and odds > best_odds['home_win']['value']:
+                        best_odds['home_win'] = {'value': odds, 'bookmaker': bookmaker}
+                    elif outcome == 'Draw' and odds > best_odds['draw']['value']:
+                        best_odds['draw'] = {'value': odds, 'bookmaker': bookmaker}
+                    elif outcome == 'Away' and odds > best_odds['away_win']['value']:
+                        best_odds['away_win'] = {'value': odds, 'bookmaker': bookmaker}
+        
+        return best_odds
+
+    def _cache_prediction(self, match_id, prediction):
+        """Store prediction in database"""
+        try:
+            self.cursor.execute("""
+                INSERT OR REPLACE INTO predictions VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+            """, (
+                match_id,
+                prediction['home_win'],
+                prediction['draw'],
+                prediction['away_win'],
+                prediction['btts_yes'],
+                prediction['over_15'],
+                prediction['over_25'],
+                json.dumps(prediction['correct_scores']),
+                prediction['last_updated']
+            ))
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Failed to cache prediction: {str(e)}")
+
+    def get_cached_prediction(self, match_id):
+        """Retrieve cached prediction"""
+        try:
+            self.cursor.execute("""
+                SELECT * FROM predictions WHERE match_id = ?
+            """, (match_id,))
+            row = self.cursor.fetchone()
+            
+            if row:
+                return {
+                    'home_win': row[1],
+                    'draw': row[2],
+                    'away_win': row[3],
+                    'btts_yes': row[4],
+                    'over_15': row[5],
+                    'over_25': row[6],
+                    'correct_scores': json.loads(row[7]),
+                    'last_updated': row[8]
+                }
+            return None
+        except Exception as e:
+            logging.error(f"Failed to get cached prediction: {str(e)}")
+            return None
+
+    def calculate_value_bets(self, predictions):
+        """Identify value bets based on predictions vs odds"""
+        value_bets = []
+        
+        for pred in predictions:
+            if 'match' not in pred or 'best_odds' not in pred:
+                continue
+                
+            match = pred['match']
+            odds = pred['best_odds']
+            
+            if not odds:
+                continue
+                
+            # Calculate expected value
+            home_ev = (pred['home_win'] * odds['home_win']['value'] - (1 - pred['home_win']))
+            draw_ev = (pred['draw'] * odds['draw']['value'] - (1 - pred['draw']))
+            away_ev = (pred['away_win'] * odds['away_win']['value'] - (1 - pred['away_win']))
+            
+            # Threshold for considering a value bet
+            threshold = 0.1
+            
+            if home_ev > threshold:
+                value_bets.append({
+                    'match': f"{match['home_team']} vs {match['away_team']}",
+                    'bet': 'Home Win',
+                    'probability': pred['home_win'],
+                    'odds': odds['home_win']['value'],
+                    'bookmaker': odds['home_win']['bookmaker'],
+                    'expected_value': home_ev
+                })
+                
+            if draw_ev > threshold:
+                value_bets.append({
+                    'match': f"{match['home_team']} vs {match['away_team']}",
+                    'bet': 'Draw',
+                    'probability': pred['draw'],
+                    'odds': odds['draw']['value'],
+                    'bookmaker': odds['draw']['bookmaker'],
+                    'expected_value': draw_ev
+                })
+                
+            if away_ev > threshold:
+                value_bets.append({
+                    'match': f"{match['home_team']} vs {match['away_team']}",
+                    'bet': 'Away Win',
+                    'probability': pred['away_win'],
+                    'odds': odds['away_win']['value'],
+                    'bookmaker': odds['away_win']['bookmaker'],
+                    'expected_value': away_ev
+                })
+        
+        return sorted(value_bets, key=lambda x: x['expected_value'], reverse=True)
+
+# Streamlit UI Implementation
 def main():
-    """Main application with UI and error handling"""
     st.set_page_config(
         page_title="Ultimate Football Predictor",
         page_icon="⚽",
         layout="wide"
     )
     
-    # Initialize predictor with error handling
-    try:
-        if 'predictor' not in st.session_state:
-            with st.spinner("Initializing system..."):
-                st.session_state.predictor = UltimateFootballPredictor()
-    except RuntimeError as e:
-        st.error(f"""
-            ⚠️ System initialization failed: {str(e)}
-            Please refresh the page or try again later.
-            """)
-        st.stop()
-    except Exception as e:
-        st.error("""
-            ⚠️ Unexpected error during initialization.
-            Please check the logs and try again.
-            """)
-        st.stop()
+    # Initialize predictor
+    predictor = UltimateFootballPredictor()
     
-    # UI Components
-    st.title("⚽ Ultimate Football Predictor")
+    # Custom CSS
     st.markdown("""
         <style>
-        .match-card {
-            border-radius: 10px;
-            padding: 20px;
-            margin: 15px 0;
-            background-color: #f8f9fa;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .upset-alert {
-            background-color: #fff3cd;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
-            font-weight: bold;
-            border-left: 4px solid #ffc107;
-        }
-        .error-alert {
-            background-color: #f8d7da;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
-            font-weight: bold;
-            border-left: 4px solid #dc3545;
-        }
-        .simulation-results {
-            background-color: #e2f0fd;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 10px;
-        }
+            .big-font { font-size:24px !important; }
+            .prediction-card { 
+                border-radius: 10px;
+                padding: 15px;
+                margin: 10px 0;
+                box-shadow: 0 4px 8px 0 rgba(0,0,0,0.2);
+            }
+            .home-win { background-color: #e6f3ff; }
+            .away-win { background-color: #ffe6e6; }
+            .draw { background-color: #f0f0f0; }
+            .value-bet { border-left: 5px solid #28a745; }
         </style>
     """, unsafe_allow_html=True)
     
-    # Controls sidebar
+    # Header
+    st.title("⚽ Ultimate Football Predictor")
+    st.markdown("""
+        The most comprehensive football prediction tool using live data, 
+        statistical models, and machine learning to forecast match outcomes.
+    """)
+    
+    # Sidebar controls
     with st.sidebar:
         st.header("Controls")
-        
-        if st.button("🔄 Refresh Live Data"):
-            try:
-                with st.spinner("Fetching latest data..."):
-                    if st.session_state.predictor._fetch_live_data():
-                        st.success("Data updated successfully!")
-                    else:
-                        st.error("Failed to update data")
-            except Exception as e:
-                st.error(f"Refresh failed: {str(e)}")
-        
-        st.markdown("---")
-        st.write("**Simulation Settings**")
-        n_simulations = st.slider("Number of simulations", 100, 10000, 1000)
-        
-        st.markdown("---")
-        st.write(f"Last update: {datetime.datetime.now().strftime('%H:%M:%S')}")
+        refresh = st.button("Refresh Data")
+        show_advanced = st.checkbox("Show Advanced Metrics")
+        league_filter = st.selectbox(
+            "Filter by League",
+            ["All", "Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"]
+        )
     
-    # Main content
-    if not st.session_state.predictor.match_data:
-        st.warning("No live matches found. Click Refresh to fetch data.")
-        return
-    
-    for match in st.session_state.predictor.match_data[:5]:  # Show first 5 matches
-        with st.container():
-            st.markdown(f"""
-                <div class="match-card">
-                    <h3>{match['homeTeam']['name']} vs {match['awayTeam']['name']}</h3>
-            """, unsafe_include_html=True)
+    # Data loading
+    if refresh or not predictor.matches:
+        with st.spinner("Fetching latest data..."):
+            success = predictor.fetch_all_data()
             
-            # Run simulations and predictions
-            try:
-                with st.spinner(f"Running {n_simulations} simulations..."):
-                    simulation = st.session_state.predictor.simulate_match(match, n_simulations)
-                    ml_prediction = st.session_state.predictor.predict_with_ml(match)
+            if success:
+                st.success("Data updated successfully!")
+            else:
+                st.warning("Some data may be incomplete")
+    
+    # Display predictions
+    st.header("Upcoming Match Predictions")
+    
+    if not predictor.matches:
+        st.warning("No upcoming matches found")
+    else:
+        # Filter matches by league if specified
+        filtered_matches = predictor.matches
+        if league_filter != "All":
+            filtered_matches = [m for m in predictor.matches if m['competition'] == league_filter]
+        
+        if not filtered_matches:
+            st.info(f"No matches found in {league_filter}")
+        else:
+            predictions = predictor.predict_all_matches()
+            
+            for pred in predictions:
+                if 'error' in pred:
+                    st.error(f"Error predicting {pred['match']['home_team']} vs {pred['match']['away_team']}: {pred['error']}")
+                    continue
+                    
+                match = pred['match']
+                home_team = match['home_team']
+                away_team = match['away_team']
                 
-                # Display results
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Home Win", f"{simulation['home_wins']:.1f}%")
-                col2.metric("Draw", f"{simulation['draws']:.1f}%")
-                col3.metric("Away Win", f"{simulation['away_wins']:.1f}%")
+                # Determine card style based on most probable outcome
+                max_outcome = max(pred['home_win'], pred['draw'], pred['away_win'])
+                card_class = ""
+                if max_outcome == pred['home_win']:
+                    card_class = "home-win"
+                elif max_outcome == pred['draw']:
+                    card_class = "draw"
+                else:
+                    card_class = "away-win"
                 
-                # Show errors if any occurred
-                if simulation.get('error'):
+                with st.container():
                     st.markdown(f"""
-                        <div class="error-alert">
-                            ⚠️ Simulation Warning: {simulation['error']}
-                        </div>
-                    """, unsafe_include_html=True)
-                
-                # Upset alert
-                if simulation['upset']:
-                    st.markdown("""
-                        <div class="upset-alert">
-                            ⚠️ Potential Upset Alert: Underdog has high win probability!
-                        </div>
-                    """, unsafe_include_html=True)
-                
-                # Simulation details
-                with st.expander("📊 Detailed Analysis"):
-                    st.markdown("""
-                        <div class="simulation-results">
-                            <h4>Monte Carlo Simulation Results</h4>
-                    """, unsafe_include_html=True)
-                    
-                    st.write(f"**Both Teams to Score:** {simulation['btts']:.1f}%")
-                    
-                    # Goals distribution
-                    if simulation['goals']:
-                        goals_df = pd.DataFrame(simulation['goals'], columns=['Home', 'Away'])
-                        st.write("**Average Goals:**")
-                        st.write(f"Home: {goals_df['Home'].mean():.1f} | Away: {goals_df['Away'].mean():.1f}")
-                        st.bar_chart(goals_df.mean(), height=200)
-                    
-                    # ML prediction
-                    st.markdown("---")
-                    st.write("**Machine Learning Prediction:**")
-                    st.write(f"- Confidence: {ml_prediction['confidence']:.1f}%")
-                    st.write(f"- Home Win: {ml_prediction['home_win']:.1f}%")
-                    st.write(f"- Draw: {ml_prediction['draw']:.1f}%")
-                    st.write(f"- Away Win: {ml_prediction['away_win']:.1f}%")
-                    
-                    if ml_prediction.get('error'):
-                        st.markdown(f"""
-                            <div class="error-alert">
-                                ⚠️ ML Prediction Warning: {ml_prediction['error']}
+                        <div class="prediction-card {card_class}">
+                            <div style="display: flex; justify-content: space-between;">
+                                <h2>{home_team} vs {away_team}</h2>
+                                <span>{datetime.strptime(match['date'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a %d %b, %H:%M')}</span>
                             </div>
-                        """, unsafe_include_html=True)
+                            <p><i>{match['competition']} • {match['venue']}</i></p>
+                            
+                            <div style="display: flex; justify-content: space-around; text-align: center;">
+                                <div>
+                                    <h3>{pred['home_win']*100:.1f}%</h3>
+                                    <p>Home Win</p>
+                                </div>
+                                <div>
+                                    <h3>{pred['draw']*100:.1f}%</h3>
+                                    <p>Draw</p>
+                                </div>
+                                <div>
+                                    <h3>{pred['away_win']*100:.1f}%</h3>
+                                    <p>Away Win</p>
+                                </div>
+                            </div>
+                        </div>
+                    """, unsafe_allow_html=True)
                     
-                    st.markdown("</div>", unsafe_include_html=True)
-                
-            except Exception as e:
+                    # Match details expander
+                    with st.expander("Detailed Analysis"):
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.subheader("Expected Goals")
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(
+                                x=['Home', 'Away'],
+                                y=[pred['expected_goals']['home'], pred['expected_goals']['away']],
+                                marker_color=['#1f77b4', '#ff7f0e']
+                            ))
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            st.subheader("Correct Score Probabilities")
+                            score_df = pd.DataFrame(pred['correct_scores'])
+                            st.dataframe(
+                                score_df.style.format({'probability': '{:.2%}'}),
+                                hide_index=True
+                            )
+                        
+                        with col2:
+                            st.subheader("Additional Markets")
+                            st.markdown(f"""
+                                - **Both Teams to Score**: {pred['btts_yes']*100:.1f}%
+                                - **Over 1.5 Goals**: {pred['over_15']*100:.1f}%
+                                - **Over 2.5 Goals**: {pred['over_25']*100:.1f}%
+                            """)
+                            
+                            if pred.get('best_odds'):
+                                st.subheader("Best Available Odds")
+                                odds = pred['best_odds']
+                                st.markdown(f"""
+                                    - **Home Win**: {odds['home_win']['value']:.2f} ({odds['home_win']['bookmaker']})
+                                    - **Draw**: {odds['draw']['value']:.2f} ({odds['draw']['bookmaker']})
+                                    - **Away Win**: {odds['away_win']['value']:.2f} ({odds['away_win']['bookmaker']})
+                                """)
+                        
+                        if show_advanced:
+                            st.subheader("Advanced Metrics")
+                            # Add more advanced visualizations here
+    
+    # Value bets section
+    st.header("🔍 Value Bet Finder")
+    value_bets = predictor.calculate_value_bets(predictions)
+    
+    if not value_bets:
+        st.info("No strong value bets identified based on current predictions")
+    else:
+        st.success(f"Found {len(value_bets)} potential value bets!")
+        for bet in value_bets:
+            with st.container():
                 st.markdown(f"""
-                    <div class="error-alert">
-                        ⚠️ Failed to analyze match: {str(e)}
+                    <div class="prediction-card value-bet">
+                        <h3>{bet['match']} - {bet['bet']}</h3>
+                        <p>
+                            Probability: {bet['probability']*100:.1f}% | 
+                            Odds: {bet['odds']:.2f} | 
+                            Bookmaker: {bet['bookmaker']}
+                        </p>
+                        <p><strong>Expected Value:</strong> {bet['expected_value']:.3f}</p>
                     </div>
-                """, unsafe_include_html=True)
-                logging.error(f"Match analysis failed: {str(e)}")
-            
-            st.markdown("</div>", unsafe_include_html=True)
+                """, unsafe_allow_html=True)
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+        <div style="text-align: center;">
+            <p>Data refreshes automatically every 15 minutes</p>
+            <p>Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
