@@ -1,17 +1,7 @@
 streamlit
-pandas
-numpy
-scipy
 requests
-beautifulsoup4
-bcrypt
-fuzzywuzzy
-xgboost
-scikit-learn
-plotly
-joblib
-python-dotenv
-meteostat 
-# Optional
-python-Levenshtein
-psutil 
+numpy
+numba 
+njit 
+prange
+datetime
