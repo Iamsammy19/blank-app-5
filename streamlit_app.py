@@ -1,6 +1,7 @@
 # V6 PREDATOR — FINAL WITH PLAYER STATS (THE ULTIMATE)
 import streamlit as st
 import requests
+import numpy as np
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="V6 PREDATOR", layout="centered")
